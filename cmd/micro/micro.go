@@ -18,15 +18,16 @@ import (
 
 	"github.com/go-errors/errors"
 	isatty "github.com/mattn/go-isatty"
+	"github.com/micro-editor/tcell/v2"
 	lua "github.com/yuin/gopher-lua"
 	"github.com/zyedidia/micro/v2/internal/action"
 	"github.com/zyedidia/micro/v2/internal/buffer"
 	"github.com/zyedidia/micro/v2/internal/clipboard"
 	"github.com/zyedidia/micro/v2/internal/config"
+	"github.com/zyedidia/micro/v2/internal/gui"
 	"github.com/zyedidia/micro/v2/internal/screen"
 	"github.com/zyedidia/micro/v2/internal/shell"
 	"github.com/zyedidia/micro/v2/internal/util"
-	"github.com/micro-editor/tcell/v2"
 )
 
 var (
@@ -38,6 +39,9 @@ var (
 	flagProfile   = flag.Bool("profile", false, "Enable CPU profiling (writes profile info to ./micro.prof)")
 	flagPlugin    = flag.String("plugin", "", "Plugin command")
 	flagClean     = flag.Bool("clean", false, "Clean configuration directory")
+	flagTerminal  = flag.Bool("terminal", false, "Start in terminal mode instead of GUI")
+	flagNoToolbar = flag.Bool("no-toolbar", false, "Hide toolbar in GUI mode")
+	flagDarkTheme = flag.Bool("dark-theme", false, "Use dark theme in GUI mode")
 	optionFlags   map[string]*string
 
 	sighup chan os.Signal
@@ -59,6 +63,12 @@ func InitFlags() {
 		fmt.Println("    \tShow all option help")
 		fmt.Println("-debug")
 		fmt.Println("    \tEnable debug mode (enables logging to ./log.txt)")
+		fmt.Println("-terminal")
+		fmt.Println("    \tStart micro in terminal mode (no GUI)")
+		fmt.Println("-no-toolbar")
+		fmt.Println("    \tHide toolbar in GUI mode")
+		fmt.Println("-dark-theme")
+		fmt.Println("    \tUse dark theme in GUI mode")
 		fmt.Println("-profile")
 		fmt.Println("    \tEnable CPU profiling (writes profile info to ./micro.prof")
 		fmt.Println("    \tso it can be analyzed later with \"go tool pprof micro.prof\")")
@@ -266,6 +276,7 @@ func exit(rc int) {
 	os.Exit(rc)
 }
 
+// main is the main function that starts the program
 func main() {
 	defer func() {
 		if util.Stdout.Len() > 0 {
@@ -333,6 +344,35 @@ func main() {
 
 	DoPluginFlags()
 
+	// 应用GUI设置
+	if *flagNoToolbar {
+		gui.AppSettings.ShowToolbar = false
+	}
+
+	if *flagDarkTheme {
+		gui.AppSettings.UseDarkTheme = true
+	}
+
+	// 默认使用GUI模式，除非指定终端模式
+	if !*flagTerminal {
+		// 使用简单的初始化方式，减少复杂性
+		gui.InitApp()
+
+		// 创建主界面
+		mainGUI := gui.NewMainGUI()
+
+		// 设置窗口内容
+		gui.MainWindow.SetContent(mainGUI.GetContent())
+
+		// 确保创建一个新的空白标签页
+		mainGUI.CreateNewTab()
+
+		// 运行GUI程序
+		gui.Run()
+		return
+	}
+
+	// 终端模式
 	err = screen.Init()
 	if err != nil {
 		fmt.Println(err)
