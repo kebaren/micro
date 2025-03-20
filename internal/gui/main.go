@@ -1,650 +1,673 @@
 package gui
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
-	"time"
 
 	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"github.com/zyedidia/micro/v2/internal/buffer"
 )
 
-// MainGUI represents the main GUI of the application
+const (
+	ActivityBarWidth = 40
+	SideBarWidth     = 220
+	StatusBarHeight  = 20
+	MinSideBarWidth  = 180
+	MaxSideBarWidth  = 400
+	TabBarHeight     = 28
+)
+
+// MainGUI 表示主界面
 type MainGUI struct {
-	editorViews        map[int]*EditorView
-	content            *fyne.Container
-	currentBufferIndex int
-	tabs               *container.DocTabs
-	toolbar            *widget.Toolbar
-	contentContainer   *fyne.Container
-	sidePanel          *fyne.Container
-	fileBrowser        *fyne.Container
-	isFilePanelVisible bool
-	splitContainer     *container.Split
+	app              *App
+	activityBar      *fyne.Container
+	sideBar          *fyne.Container
+	resizableSidebar *ResizeableSidebar
+	editor           *EditorView
+	editorArea       *fyne.Container
+	bottomPanel      *BottomPanel
+	statusBar        *fyne.Container
+	content          *fyne.Container
+	fileBrowser      *FileBrowser
+	sideBarWidth     float32
+	sideBarVisible   bool
+	activeSideTab    int
+	windows          []*fyne.Window
 }
 
-// NewMainGUI creates a new main GUI
-func NewMainGUI() *MainGUI {
-	m := &MainGUI{
-		editorViews:        make(map[int]*EditorView),
-		currentBufferIndex: -1,
-		isFilePanelVisible: false,
+// NewMainGUI 创建新的主界面
+func NewMainGUI(app *App) *MainGUI {
+	gui := &MainGUI{
+		app:            app,
+		sideBarWidth:   SideBarWidth,
+		sideBarVisible: true,
+		activeSideTab:  0,
 	}
 
-	// 创建全局状态栏 - 作为单一状态显示区域
-	MainStatus = widget.NewLabel("Ready")
-	MainStatus.TextStyle = fyne.TextStyle{Monospace: true, Bold: false}
-	MainStatus.Alignment = fyne.TextAlignLeading
+	// 创建活动栏
+	gui.activityBar = gui.createActivityBar()
 
-	// 获取主题颜色
-	bg, _, _, _ := GetThemeColors()
+	// 创建文件浏览器
+	gui.fileBrowser = NewFileBrowser("", gui.openFile)
 
-	// 创建标签页 - 性能优化：延迟初始化内容
-	m.tabs = container.NewDocTabs()
-	m.tabs.SetTabLocation(container.TabLocationTop)
+	// 创建侧边栏
+	gui.sideBar = gui.createSideBar()
 
-	// 创建主要内容区域容器 - 使用MaxLayout可以减少重绘操作
-	contentContainer := container.NewMax()
+	// 创建可调整大小的侧边栏
+	gui.resizableSidebar = NewResizeableSidebar(gui.sideBar, gui.sideBarWidth, MinSideBarWidth, MaxSideBarWidth, func(width float32) {
+		// 当宽度改变时的回调
+		gui.sideBarWidth = width
 
-	// 性能优化：限制标签页变更后的重绘频率
-	var tabChangeTimer *time.Timer
-	m.tabs.OnSelected = func(tab *container.TabItem) {
-		// 内存优化：如果有上一个计时器，停止它并清理内存
-		if tabChangeTimer != nil {
-			tabChangeTimer.Stop()
-			tabChangeTimer = nil
+		// 调整侧边栏大小
+		gui.sideBar.Resize(fyne.NewSize(width, gui.app.mainWindow.Canvas().Size().Height))
+
+		// 更新整个布局
+		gui.updateLayout()
+
+		// 重要：强制更新整个窗口内容
+		if gui.app != nil && gui.app.mainWindow != nil {
+			gui.app.mainWindow.SetContent(gui.content)
+			gui.app.mainWindow.Canvas().Refresh(gui.content)
 		}
-
-		// 使用更轻量的延迟处理，避免频繁切换标签时的内存占用
-		tabChangeTimer = time.AfterFunc(100*time.Millisecond, func() {
-			// 查找对应的缓冲区索引
-			for i, buf := range buffer.OpenBuffers {
-				if tab.Text == filepath.Base(buf.GetName()) {
-					// 仅在索引变化时更新
-					if m.currentBufferIndex != i {
-						m.currentBufferIndex = i
-
-						// 更新内容容器显示当前选中的编辑器
-						if edView, exists := m.editorViews[i]; exists && edView != nil {
-							// 内存优化：直接替换而非添加删除对象
-							if len(contentContainer.Objects) > 0 {
-								contentContainer.Objects[0] = edView.GetContainer()
-							} else {
-								contentContainer.Objects = []fyne.CanvasObject{edView.GetContainer()}
-							}
-							contentContainer.Refresh()
-						}
-					}
-					break
-				}
-			}
-
-			// 清理计时器引用
-			tabChangeTimer = nil
-		})
-	}
-
-	// 为双击检测设置变量
-	var lastClickTime int64
-	// 处理Tab空白区域点击 - 实现双击检测但减少频繁创建
-	m.tabs.OnUnselected = func(tab *container.TabItem) {
-		// 检查是否在空白区域点击
-		if tab == nil {
-			currentTime := time.Now().UnixMilli()
-			if currentTime-lastClickTime < 500 { // 500ms内的两次点击视为双击
-				// 延迟创建新文件，避免UI冻结
-				go func() {
-					time.Sleep(10 * time.Millisecond)
-					m.CreateNewTab()
-				}()
-			}
-			lastClickTime = currentTime
-		}
-	}
-
-	// VSCode风格的新建标签按钮 - 使用主题颜色
-	newTabButton := widget.NewButtonWithIcon("", theme.ContentAddIcon(), func() {
-		// 创建新文件
-		m.CreateNewTab()
 	})
-	newTabButton.Importance = widget.LowImportance
-	newTabButton.Resize(fyne.NewSize(24, 24))
 
-	// 创建文件浏览器面板
-	m.createFileBrowser()
+	// 创建编辑器
+	gui.editor = NewEditorView()
 
-	// VSCode风格的活动栏布局 - 性能优化：降低活动栏复杂度
-	activityBar := container.NewVBox()
+	// 创建编辑器区域
+	gui.editorArea = gui.createEditorArea()
 
-	// 背景矩形使整个左侧面板更加明显
-	activityBarBg := canvas.NewRectangle(bg)
-	activityBarBg.SetMinSize(fyne.NewSize(48, 0))
+	// 创建底部面板
+	gui.bottomPanel = NewBottomPanel()
 
-	// 创建侧边栏按钮 - 添加文件浏览器功能
-	fileExplorerButton := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
-		// 切换文件浏览器面板的可见性
-		m.toggleFileBrowser()
+	// 创建状态栏
+	gui.statusBar = gui.createStatusBar()
+
+	// 创建主布局
+	gui.updateLayout()
+
+	// 确保布局在窗口大小变化时更新
+	app.mainWindow.Canvas().SetOnTypedKey(func(ke *fyne.KeyEvent) {
+		// 处理按键事件
 	})
-	fileExplorerButton.Importance = widget.LowImportance
 
-	searchButton := widget.NewButtonWithIcon("", theme.SearchIcon(), func() {
-		// 搜索功能，暂不实现
-		UpdateMainStatus("Search function not implemented yet")
-	})
-	searchButton.Importance = widget.LowImportance
+	return gui
+}
 
-	// 添加按钮到活动栏
-	activityBar.Add(fileExplorerButton)
-	activityBar.Add(searchButton)
+// updateLayout 更新布局
+func (g *MainGUI) updateLayout() {
+	// 获取窗口尺寸
+	windowWidth := g.app.mainWindow.Canvas().Size().Width
+	windowHeight := g.app.mainWindow.Canvas().Size().Height
 
-	// 添加设置按钮到活动栏底部
-	settingsButton := widget.NewButtonWithIcon("", theme.SettingsIcon(), func() {
-		// 设置功能暂不实现
-		UpdateMainStatus("Settings panel not implemented yet")
-	})
-	settingsButton.Importance = widget.LowImportance
+	var leftSide fyne.CanvasObject
 
-	// 添加一个弹性空间，将设置按钮推到底部
-	activityBar.Add(layout.NewSpacer())
-	activityBar.Add(settingsButton)
+	if g.sideBarVisible {
+		// 应用新的宽度到侧边栏和可调整大小的侧边栏
+		g.sideBar.Resize(fyne.NewSize(g.sideBarWidth, windowHeight))
+		g.resizableSidebar.Resize(fyne.NewSize(g.sideBarWidth, windowHeight))
 
-	// 创建左侧面板容器，确保活动栏有固定宽度
-	activityBarContainer := container.New(layout.NewMaxLayout(), activityBarBg, activityBar)
-
-	// 创建侧边面板容器，默认包含文件浏览器但不显示
-	m.sidePanel = container.NewMax()
-
-	// 设置所有标签右侧的按钮
-	tabButtons := container.NewHBox(newTabButton)
-
-	// 创建VSCode风格布局 - 性能优化：减少容器层级
-	var topBarContainer fyne.CanvasObject
-
-	if AppSettings.ShowToolbar {
-		m.toolbar = m.createToolbar()
-
-		// 创建顶部区域：工具栏和标签栏
-		topBarContainer = container.NewBorder(
-			m.toolbar,
-			nil,
-			nil,
-			tabButtons,
-			m.tabs,
+		leftSide = container.NewHBox(
+			g.activityBar,
+			g.resizableSidebar,
 		)
 	} else {
-		// 不显示工具栏，创建更简洁的VSCode风格布局
-		topBarContainer = container.NewBorder(
-			nil,
-			nil,
-			nil,
-			tabButtons,
-			m.tabs,
+		leftSide = g.activityBar
+	}
+
+	// 计算编辑器区域宽度 - 确保填充所有可用空间
+	editorWidth := windowWidth - ActivityBarWidth
+	if g.sideBarVisible {
+		editorWidth -= g.sideBarWidth
+	}
+
+	// 使用Max容器确保编辑器区域填充所有可用空间
+	g.editorArea.Resize(fyne.NewSize(editorWidth, windowHeight-g.bottomPanel.GetContent().Size().Height-StatusBarHeight))
+	editorContainer := container.NewMax(g.editorArea)
+
+	// 创建底部区域，根据底部面板的可见性决定是否显示
+	var bottomArea fyne.CanvasObject
+	if g.bottomPanel.IsVisible() {
+		// 调整底部面板宽度
+		g.bottomPanel.GetContent().Resize(fyne.NewSize(editorWidth, g.bottomPanel.GetContent().Size().Height))
+		bottomArea = container.NewMax(g.bottomPanel.GetContent())
+	} else {
+		// 隐藏底部面板，使用空容器
+		bottomArea = container.NewMax()
+	}
+
+	// 创建主布局
+	mainContent := container.NewBorder(
+		nil,        // top
+		bottomArea, // bottom
+		nil, nil,   // left, right
+		editorContainer, // center
+	)
+
+	// 创建完整布局
+	g.content = container.NewBorder(
+		nil,         // top
+		g.statusBar, // bottom
+		leftSide,    // left
+		nil,         // right
+		mainContent, // center
+	)
+
+	// 重要：立即设置主窗口内容以应用更新
+	if g.app != nil && g.app.mainWindow != nil {
+		g.app.mainWindow.SetContent(g.content)
+		// 强制刷新以确保布局更新
+		g.app.mainWindow.Canvas().Refresh(g.content)
+	}
+}
+
+// createResizeHandle 创建侧边栏宽度调整控件
+func (g *MainGUI) createResizeHandle() fyne.CanvasObject {
+	handle := widget.NewLabel("")
+	handle.Resize(fyne.NewSize(4, 1000)) // 垂直调整条
+
+	// 自定义渲染器
+	handle.ExtendBaseWidget(handle)
+
+	// 在这里我们需要实现鼠标拖拽逻辑
+	// 由于Fyne的标准组件不直接支持拖拽调整大小，这里提供一个示意
+	// 实际实现时可能需要自定义组件或使用其他方法
+
+	return container.NewHBox(
+		widget.NewSeparator(),
+	)
+}
+
+// GetContent 获取主界面内容
+func (g *MainGUI) GetContent() fyne.CanvasObject {
+	return g.content
+}
+
+// toggleSideBar 切换侧边栏显示状态
+func (g *MainGUI) toggleSideBar(tabIndex int) {
+	if g.activeSideTab == tabIndex && g.sideBarVisible {
+		// 如果点击当前活动的标签页，则隐藏侧边栏
+		g.sideBarVisible = false
+	} else {
+		// 否则显示侧边栏并切换到该标签页
+		g.sideBarVisible = true
+		g.activeSideTab = tabIndex
+		g.updateSideBarContent()
+	}
+
+	// 更新布局
+	g.updateLayout()
+
+	// 刷新内容
+	if g.app != nil && g.app.mainWindow != nil {
+		g.app.mainWindow.SetContent(g.content)
+	}
+}
+
+// updateSideBarContent 更新侧边栏内容
+func (g *MainGUI) updateSideBarContent() {
+	// 基于activeSideTab更新侧边栏内容
+	switch g.activeSideTab {
+	case 0: // 文件浏览器
+		header := container.NewBorder(
+			nil, nil,
+			widget.NewLabel("资源管理器"),
+			container.NewHBox(
+				widget.NewButtonWithIcon("", theme.ContentAddIcon(), func() {
+					// 创建新文件
+					g.createNewFile()
+				}),
+				widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
+					// 打开文件夹
+					g.openFolder()
+				}),
+				widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
+					// 刷新
+					g.refreshFileBrowser()
+				}),
+			),
 		)
+
+		g.sideBar.Objects = []fyne.CanvasObject{
+			container.NewBorder(
+				header,
+				nil, nil, nil,
+				container.NewVBox(), // 清空内容区域
+			),
+		}
+	case 1: // 搜索
+		g.sideBar.Objects = []fyne.CanvasObject{
+			container.NewBorder(
+				container.NewVBox(
+					widget.NewLabel("搜索"),
+					widget.NewEntry(),
+				),
+				nil, nil, nil,
+				container.NewVBox(), // 清空内容区域
+			),
+		}
+	case 2: // 源代码管理
+		g.sideBar.Objects = []fyne.CanvasObject{
+			container.NewBorder(
+				container.NewVBox(
+					widget.NewLabel("源代码管理"),
+				),
+				nil, nil, nil,
+				container.NewVBox(), // 清空内容区域
+			),
+		}
+	case 3: // 调试
+		g.sideBar.Objects = []fyne.CanvasObject{
+			container.NewBorder(
+				container.NewVBox(
+					widget.NewLabel("运行和调试"),
+				),
+				nil, nil, nil,
+				container.NewVBox(), // 清空内容区域
+			),
+		}
+	case 4: // 扩展
+		g.sideBar.Objects = []fyne.CanvasObject{
+			container.NewBorder(
+				container.NewVBox(
+					widget.NewLabel("扩展"),
+					widget.NewEntry(),
+				),
+				nil, nil, nil,
+				container.NewVBox(), // 清空内容区域
+			),
+		}
 	}
 
-	// 准备侧边内容容器 - 活动栏和可展开区域
-	sidePanelWithActivityBar := container.New(
-		layout.NewBorderLayout(nil, nil, activityBarContainer, nil),
-		activityBarContainer,
-		m.sidePanel,
-	)
-
-	// 使用Split容器实现可调整宽度的侧边栏
-	// 默认设置侧边栏宽度为0（不可见），可以通过拖动调整宽度
-	m.splitContainer = container.NewHSplit(
-		sidePanelWithActivityBar,
-		contentContainer,
-	)
-
-	// 设置初始分割比例，0表示完全隐藏左侧面板，只显示活动栏
-	m.splitContainer.SetOffset(0)
-
-	// 主布局 - 使用全局状态栏替代本地状态栏
-	m.content = container.NewBorder(
-		topBarContainer,  // 顶部区域 - 包含标签页
-		MainStatus,       // 底部状态栏 - 使用全局状态栏
-		nil,              // 左侧为空，因为已经在splitContent中设置
-		nil,              // 右侧
-		m.splitContainer, // 中心区域是可调整大小的分割内容
-	)
-
-	// 保存内容容器的引用，方便后续访问
-	m.contentContainer = contentContainer
-
-	// 设置菜单栏，包含工具栏功能按钮
-	m.setupMainMenu()
-
-	return m
+	// 应用新的大小
+	g.sideBar.Resize(fyne.NewSize(g.sideBarWidth, g.app.mainWindow.Canvas().Size().Height))
 }
 
-// setupMainMenu creates the main menu for the application with toolbar functions
-func (m *MainGUI) setupMainMenu() {
-	// 文件菜单
-	fileMenu := fyne.NewMenu("File",
-		fyne.NewMenuItem("New", func() { m.newFile() }),
-		fyne.NewMenuItem("Open", func() { m.openFile() }),
-		fyne.NewMenuItem("Save", func() { m.saveFile() }),
-		fyne.NewMenuItem("Save As", func() { m.saveFileAs() }),
-		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Quit", func() { App.Quit() }),
-	)
+// createActivityBar 创建活动栏
+func (g *MainGUI) createActivityBar() *fyne.Container {
+	// 创建活动栏按钮 - 使用更小的尺寸
+	explorerBtn := widget.NewButtonWithIcon("", theme.FolderIcon(), func() {
+		g.toggleSideBar(0)
+	})
+	explorerBtn.Importance = widget.LowImportance
 
-	// 编辑菜单
-	editMenu := fyne.NewMenu("Edit",
-		fyne.NewMenuItem("Cut", func() {
-			if edView := m.getCurrentEditorView(); edView != nil {
-				edView.textArea.TypedShortcut(&fyne.ShortcutCut{Clipboard: MainWindow.Clipboard()})
-			}
-		}),
-		fyne.NewMenuItem("Copy", func() {
-			if edView := m.getCurrentEditorView(); edView != nil {
-				edView.textArea.TypedShortcut(&fyne.ShortcutCopy{Clipboard: MainWindow.Clipboard()})
-			}
-		}),
-		fyne.NewMenuItem("Paste", func() {
-			if edView := m.getCurrentEditorView(); edView != nil {
-				edView.textArea.TypedShortcut(&fyne.ShortcutPaste{Clipboard: MainWindow.Clipboard()})
-			}
-		}),
-		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Find", func() {
-			// 未实现
-		}),
-		fyne.NewMenuItem("Replace", func() {
-			// 未实现
-		}),
-	)
+	searchBtn := widget.NewButtonWithIcon("", theme.SearchIcon(), func() {
+		g.toggleSideBar(1)
+	})
+	searchBtn.Importance = widget.LowImportance
 
-	// 视图菜单
-	viewMenu := fyne.NewMenu("View",
-		fyne.NewMenuItem("Show Toolbar", func() {
-			AppSettings.ShowToolbar = !AppSettings.ShowToolbar
-			// 重新创建UI
-			newGUI := NewMainGUI()
-			MainWindow.SetContent(newGUI.GetContent())
-			MainWindow.Show()
-		}),
-		fyne.NewMenuItem("Toggle Theme", func() {
-			AppSettings.UseDarkTheme = !AppSettings.UseDarkTheme
-			App.Settings().SetTheme(newCompactTheme())
-		}),
-		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Syntax Highlighting", func() {}),
-		fyne.NewMenuItem("Line Numbers", func() {}),
-		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Full Screen", func() {
-			MainWindow.SetFullScreen(!MainWindow.FullScreen())
-		}),
-	)
+	sourceControlBtn := widget.NewButtonWithIcon("", theme.StorageIcon(), func() {
+		g.toggleSideBar(2)
+	})
+	sourceControlBtn.Importance = widget.LowImportance
 
-	// 使用更大字体的主菜单
-	mainMenu := fyne.NewMainMenu(
-		fileMenu,
-		editMenu,
-		viewMenu,
-	)
+	runDebugBtn := widget.NewButtonWithIcon("", theme.SettingsIcon(), func() {
+		g.toggleSideBar(3)
+	})
+	runDebugBtn.Importance = widget.LowImportance
 
-	MainWindow.SetMainMenu(mainMenu)
-}
+	extensionsBtn := widget.NewButtonWithIcon("", theme.SettingsIcon(), func() {
+		g.toggleSideBar(4)
+	})
+	extensionsBtn.Importance = widget.LowImportance
 
-// createToolbar creates a toolbar with common actions
-func (m *MainGUI) createToolbar() *widget.Toolbar {
-	toolbar := widget.NewToolbar(
-		widget.NewToolbarAction(theme.DocumentCreateIcon(), func() { m.newFile() }),
-		widget.NewToolbarAction(theme.FolderOpenIcon(), func() { m.openFile() }),
-		widget.NewToolbarAction(theme.DocumentSaveIcon(), func() { m.saveFile() }),
-		widget.NewToolbarSeparator(),
-		widget.NewToolbarAction(theme.ContentCutIcon(), func() {
-			if edView := m.getCurrentEditorView(); edView != nil {
-				edView.textArea.TypedShortcut(&fyne.ShortcutCut{Clipboard: MainWindow.Clipboard()})
-			}
-		}),
-		widget.NewToolbarAction(theme.ContentCopyIcon(), func() {
-			if edView := m.getCurrentEditorView(); edView != nil {
-				edView.textArea.TypedShortcut(&fyne.ShortcutCopy{Clipboard: MainWindow.Clipboard()})
-			}
-		}),
-		widget.NewToolbarAction(theme.ContentPasteIcon(), func() {
-			if edView := m.getCurrentEditorView(); edView != nil {
-				edView.textArea.TypedShortcut(&fyne.ShortcutPaste{Clipboard: MainWindow.Clipboard()})
-			}
-		}),
-	)
-
-	return toolbar
-}
-
-// getCurrentEditorView returns the currently active editor view
-func (m *MainGUI) getCurrentEditorView() *EditorView {
-	if m.currentBufferIndex >= 0 && m.currentBufferIndex < len(buffer.OpenBuffers) {
-		return m.editorViews[m.currentBufferIndex]
-	}
-	return nil
-}
-
-// addTab adds a new tab for the given buffer
-func (m *MainGUI) addTab(buf *buffer.Buffer) {
-	// 创建新的编辑器视图
-	editorView := NewEditorView()
-
-	// 设置缓冲区到编辑器视图
-	editorView.SetBuffer(buf)
-
-	// 保存编辑器视图以便后续访问
-	bufferIndex := len(buffer.OpenBuffers) - 1
-	m.editorViews[bufferIndex] = editorView
-
-	// 获取文件名作为标签名
-	tabName := "Untitled"
-	if buf.Path != "" {
-		tabName = filepath.Base(buf.Path)
-	} else if buf.GetName() != "" {
-		tabName = filepath.Base(buf.GetName())
-	}
-
-	// 创建空容器作为标签页内容 (实际内容会在选择时动态显示)
-	emptyContainer := container.NewMax()
-	tab := container.NewTabItem(tabName, emptyContainer)
-
-	// 添加到标签页组并选中
-	m.tabs.Append(tab)
-	m.tabs.Select(tab)
-
-	// 直接更新主内容区域，避免通过标签选择触发
-	m.currentBufferIndex = bufferIndex
-	m.contentContainer.Objects = []fyne.CanvasObject{editorView.GetContainer()}
-
-	// 优化：只刷新必要的组件
-	m.contentContainer.Refresh()
-}
-
-// newFile creates a new file
-func (m *MainGUI) newFile() {
-	// 使用公开的CreateNewTab方法
-	m.CreateNewTab()
-}
-
-// openFile opens a file dialog to open a file
-func (m *MainGUI) openFile() {
-	dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
-		if err != nil {
-			dialog.ShowError(err, MainWindow)
-			return
-		}
-		if reader == nil {
-			return
-		}
-		defer reader.Close()
-
-		path := reader.URI().Path()
-		buf, err := buffer.NewBufferFromFile(path, buffer.BTDefault)
-		if err != nil {
-			dialog.ShowError(err, MainWindow)
-			return
-		}
-
-		// Check if file is already open
-		for i, existingBuf := range buffer.OpenBuffers {
-			if existingBuf.Path == path {
-				// File already open, just switch to its tab
-				m.currentBufferIndex = i
-				for j, item := range m.tabs.Items {
-					if item.Text == filepath.Base(path) {
-						m.tabs.Select(m.tabs.Items[j])
-						return
+	// 添加设置按钮
+	settingsBtn := widget.NewButtonWithIcon("", theme.SettingsIcon(), func() {
+		// 在这里添加设置菜单处理
+		popup := widget.NewModalPopUp(
+			container.NewVBox(
+				widget.NewButton("设置", nil),
+				widget.NewButton("键盘快捷键", nil),
+				widget.NewButton("用户片段", nil),
+				widget.NewButton("颜色主题", func() {
+					// 切换主题
+					if g.app.settings.Theme == "dark" {
+						g.app.SetTheme("light")
+					} else {
+						g.app.SetTheme("dark")
 					}
+				}),
+			),
+			g.app.mainWindow.Canvas(),
+		)
+		popup.Show()
+	})
+	settingsBtn.Importance = widget.LowImportance
+
+	// 设置按钮大小 - 使用更小的按钮
+	buttons := []*widget.Button{explorerBtn, searchBtn, sourceControlBtn, runDebugBtn, extensionsBtn, settingsBtn}
+	for _, btn := range buttons {
+		btn.Resize(fyne.NewSize(ActivityBarWidth, ActivityBarWidth-8)) // 减小按钮高度
+	}
+
+	// 创建活动栏布局 - 更紧凑的间距
+	topButtons := container.NewVBox(
+		explorerBtn,
+		searchBtn,
+		sourceControlBtn,
+		runDebugBtn,
+		extensionsBtn,
+	)
+
+	// 去除内边距使布局更紧凑
+	topButtons.Resize(fyne.NewSize(ActivityBarWidth, ActivityBarWidth*5-10))
+
+	bottomButtons := container.NewVBox(
+		settingsBtn,
+	)
+
+	// 使用Border容器将按钮分为顶部和底部
+	return container.NewBorder(
+		nil,           // top
+		bottomButtons, // bottom
+		nil, nil,      // left, right
+		topButtons, // center - 移除内边距使布局更紧凑
+	)
+}
+
+// createSideBar 创建侧边栏
+func (g *MainGUI) createSideBar() *fyne.Container {
+	// 侧边栏容器
+	sidebar := container.NewVBox()
+
+	// 设置固定大小
+	sidebar.Resize(fyne.NewSize(g.sideBarWidth, g.app.mainWindow.Canvas().Size().Height))
+
+	return sidebar
+}
+
+// createEditorArea 创建编辑器区域
+func (g *MainGUI) createEditorArea() *fyne.Container {
+	// 创建可关闭标签容器
+	closableTabs := NewClosableTabs()
+
+	// 添加第一个标签页
+	closableTabs.AddTab("Untitled-1", g.editor.GetContent())
+
+	// 设置标签关闭事件回调，确保至少有一个标签页
+	closableTabs.OnTabClosed = func(index int) {
+		// 如果没有标签了，创建一个新的
+		if closableTabs.TabCount() == 0 {
+			go func() {
+				// 使用goroutine确保在UI更新完成后再添加新标签
+				g.createNewFile()
+			}()
+		}
+	}
+
+	// 创建双击检测区域
+	tabsContainer := NewDoubleTapContainer(closableTabs.GetContent(), func() {
+		// 双击创建新标签页
+		g.createNewFile()
+	})
+
+	// 使用 Max 容器来确保编辑器区域填充所有可用空间
+	editorContainer := container.NewMax(tabsContainer)
+
+	// 计算初始尺寸 - 确保足够大以填充可用空间
+	if g.app != nil && g.app.mainWindow != nil {
+		windowWidth := g.app.mainWindow.Canvas().Size().Width
+		windowHeight := g.app.mainWindow.Canvas().Size().Height
+
+		// 计算编辑器宽度
+		editorWidth := windowWidth - ActivityBarWidth
+		if g.sideBarVisible {
+			editorWidth -= g.sideBarWidth
+		}
+
+		// 调整编辑器容器大小
+		editorContainer.Resize(fyne.NewSize(editorWidth, windowHeight-StatusBarHeight))
+	}
+
+	return editorContainer
+}
+
+// DoubleTapContainer 是一个可双击的容器
+type DoubleTapContainer struct {
+	widget.BaseWidget
+	Content     fyne.CanvasObject
+	OnDoubleTap func()
+}
+
+// NewDoubleTapContainer 创建一个新的可双击容器
+func NewDoubleTapContainer(content fyne.CanvasObject, onDoubleTap func()) *DoubleTapContainer {
+	container := &DoubleTapContainer{
+		Content:     content,
+		OnDoubleTap: onDoubleTap,
+	}
+	container.ExtendBaseWidget(container)
+	return container
+}
+
+// CreateRenderer 创建渲染器
+func (d *DoubleTapContainer) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(d.Content)
+}
+
+// DoubleTapped 处理双击事件
+func (d *DoubleTapContainer) DoubleTapped(e *fyne.PointEvent) {
+	if d.OnDoubleTap != nil {
+		d.OnDoubleTap()
+	}
+}
+
+// MinSize 返回最小尺寸
+func (d *DoubleTapContainer) MinSize() fyne.Size {
+	return d.Content.MinSize()
+}
+
+// Resize 调整大小
+func (d *DoubleTapContainer) Resize(size fyne.Size) {
+	d.BaseWidget.Resize(size)
+	d.Content.Resize(size)
+}
+
+// Move 移动位置
+func (d *DoubleTapContainer) Move(pos fyne.Position) {
+	d.BaseWidget.Move(pos)
+	d.Content.Move(pos)
+}
+
+// Show 显示容器
+func (d *DoubleTapContainer) Show() {
+	d.BaseWidget.Show()
+	d.Content.Show()
+}
+
+// Hide 隐藏容器
+func (d *DoubleTapContainer) Hide() {
+	d.BaseWidget.Hide()
+	d.Content.Hide()
+}
+
+// createStatusBar 创建状态栏
+func (g *MainGUI) createStatusBar() *fyne.Container {
+	// 创建状态栏内容 - 使用更小的字体
+	left := widget.NewLabel("UTF-8")
+
+	// 添加底部面板显示/隐藏按钮 - 使用合适的图标替代 TerminalIcon
+	toggleTerminalBtn := widget.NewButtonWithIcon("", theme.ComputerIcon(), func() {
+		g.toggleBottomPanel()
+	})
+	toggleTerminalBtn.Importance = widget.LowImportance
+	// 调整按钮大小更小
+	toggleTerminalBtn.Resize(fyne.NewSize(18, 18))
+
+	right := container.NewHBox(
+		toggleTerminalBtn,
+		widget.NewLabel("Ln 1, Col 1"),
+	)
+
+	// 创建状态栏布局，确保其高度一致
+	statusBar := container.NewBorder(
+		nil, nil,
+		left, right,
+		nil,
+	)
+
+	// 设置固定高度
+	statusBar.Resize(fyne.NewSize(1000, StatusBarHeight))
+
+	return statusBar
+}
+
+// openFile 打开文件
+func (g *MainGUI) openFile(path string) {
+	// 读取文件内容
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+
+	// 获取文件名
+	fileName := filepath.Base(path)
+
+	// 获取标签页容器
+	var findClosableTabs func(obj fyne.CanvasObject) *ClosableTabs
+	findClosableTabs = func(obj fyne.CanvasObject) *ClosableTabs {
+		// 检查当前对象是否是DoubleTapContainer
+		if dtc, ok := obj.(*DoubleTapContainer); ok {
+			return findClosableTabs(dtc.Content)
+		}
+
+		// 检查当前对象是否是ClosableTabs的渲染内容
+		if content, ok := obj.(*fyne.Container); ok {
+			// 尝试从所有子组件中查找
+			for _, child := range content.Objects {
+				if tabs := findClosableTabs(child); tabs != nil {
+					return tabs
 				}
-				return
 			}
 		}
 
-		buffer.OpenBuffers = append(buffer.OpenBuffers, buf)
-		m.currentBufferIndex = len(buffer.OpenBuffers) - 1
-		m.addTab(buf)
-	}, MainWindow)
-}
-
-// saveFile saves the current file
-func (m *MainGUI) saveFile() {
-	if m.currentBufferIndex < 0 || m.currentBufferIndex >= len(buffer.OpenBuffers) {
-		return
-	}
-
-	buf := buffer.OpenBuffers[m.currentBufferIndex]
-	if buf.Path == "" {
-		m.saveFileAs()
-		return
-	}
-
-	// The buffer should already be updated by the editor view's change listener
-	err := buf.Save()
-	if err != nil {
-		dialog.ShowError(err, MainWindow)
-	}
-
-	// Update tab name
-	for i, item := range m.tabs.Items {
-		if i == m.tabs.SelectedIndex() {
-			item.Text = filepath.Base(buf.GetName())
-			m.tabs.Refresh()
-			break
+		// 直接检查是否是ClosableTabs
+		if ct, ok := obj.(*ClosableTabs); ok {
+			return ct
 		}
+
+		return nil
+	}
+
+	tabs := findClosableTabs(g.editorArea.Objects[0])
+
+	if tabs != nil {
+		// 创建新标签页并设置内容
+		newEditor := NewEditorView()
+		newEditor.SetText(string(content))
+
+		// 添加新标签页
+		tabIndex := tabs.AppendTab(fileName, newEditor.GetContent())
+
+		// 选择新标签页
+		tabs.SelectTab(tabIndex)
+	} else {
+		// 如果没有找到标签页容器，直接在当前编辑器中打开
+		g.editor.SetText(string(content))
 	}
 }
 
-// saveFileAs opens a file dialog to save the current file with a new name
-func (m *MainGUI) saveFileAs() {
-	if m.currentBufferIndex < 0 || m.currentBufferIndex >= len(buffer.OpenBuffers) {
-		return
+// createNewFile 创建新文件
+func (g *MainGUI) createNewFile() {
+	// 获取编辑器区域中的容器
+	maxContainer := g.editorArea.Objects[0]
+
+	// 递归查找ClosableTabs组件
+	var findClosableTabs func(obj fyne.CanvasObject) *ClosableTabs
+	findClosableTabs = func(obj fyne.CanvasObject) *ClosableTabs {
+		// 检查当前对象是否是DoubleTapContainer
+		if dtc, ok := obj.(*DoubleTapContainer); ok {
+			return findClosableTabs(dtc.Content)
+		}
+
+		// 检查当前对象是否是ClosableTabs的渲染内容
+		if content, ok := obj.(*fyne.Container); ok {
+			// 尝试从所有子组件中查找
+			for _, child := range content.Objects {
+				if tabs := findClosableTabs(child); tabs != nil {
+					return tabs
+				}
+			}
+		}
+
+		// 直接检查是否是ClosableTabs
+		if ct, ok := obj.(*ClosableTabs); ok {
+			return ct
+		}
+
+		return nil
 	}
 
-	dialog.ShowFileSave(func(writer fyne.URIWriteCloser, err error) {
-		if err != nil {
-			dialog.ShowError(err, MainWindow)
-			return
-		}
-		if writer == nil {
-			return
-		}
-		defer writer.Close()
+	// 查找并获取标签页容器
+	tabs := findClosableTabs(maxContainer)
 
-		buf := buffer.OpenBuffers[m.currentBufferIndex]
-		buf.Path = writer.URI().Path()
-
-		// The buffer should already be updated by the editor view's change listener
-		err = buf.Save()
-		if err != nil {
-			dialog.ShowError(err, MainWindow)
-			return
-		}
-
-		// Update tab name
-		for i, item := range m.tabs.Items {
-			if i == m.tabs.SelectedIndex() {
-				item.Text = filepath.Base(buf.GetName())
-				m.tabs.Refresh()
+	// 如果递归查找失败，可能容器在第一层
+	if tabs == nil {
+		// 尝试遍历所有顶层组件
+		for _, obj := range g.editorArea.Objects {
+			if foundTabs := findClosableTabs(obj); foundTabs != nil {
+				tabs = foundTabs
 				break
 			}
 		}
-	}, MainWindow)
-}
-
-// GetContent returns the main content container
-func (m *MainGUI) GetContent() fyne.CanvasObject {
-	return m.content
-}
-
-// CreateNewTab creates a new empty tab
-func (m *MainGUI) CreateNewTab() {
-	// 使用原有的newFile方法逻辑，创建一个新的空白标签页
-	// 创建一个真正的空白缓冲区而不是复制现有内容
-	buf := buffer.NewBufferFromString("", "Untitled", buffer.BTDefault)
-
-	// 添加到全局缓冲区列表
-	buffer.OpenBuffers = append(buffer.OpenBuffers, buf)
-
-	// 设置当前缓冲区索引
-	m.currentBufferIndex = len(buffer.OpenBuffers) - 1
-
-	// 创建新的编辑器视图
-	editorView := NewEditorView()
-
-	// 直接设置缓冲区到编辑器视图，确保是一个干净的视图
-	editorView.SetBuffer(buf)
-
-	// 保存编辑器视图以便后续访问
-	bufferIndex := len(buffer.OpenBuffers) - 1
-	m.editorViews[bufferIndex] = editorView
-
-	// 获取文件名作为标签名
-	tabName := "Untitled"
-
-	// 创建空容器作为标签页内容
-	emptyContainer := container.NewMax()
-	tab := container.NewTabItem(tabName, emptyContainer)
-
-	// 添加到标签页组并选中
-	m.tabs.Append(tab)
-	m.tabs.Select(tab)
-
-	// 直接更新主内容区域
-	m.contentContainer.Objects = []fyne.CanvasObject{editorView.GetContainer()}
-
-	// 仅刷新内容容器，避免刷新整个UI
-	m.contentContainer.Refresh()
-
-	// 设置状态栏信息 - 使用全局状态栏更新
-	UpdateMainStatus("New file created")
-}
-
-// createFileBrowser 创建文件浏览器面板
-func (m *MainGUI) createFileBrowser() {
-	// 创建文件浏览器标题
-	title := widget.NewLabel("文件浏览器")
-	title.TextStyle = fyne.TextStyle{Bold: true}
-
-	// 创建一个目录树视图
-	list := widget.NewList(
-		func() int { return 3 }, // 示例项目数量
-		func() fyne.CanvasObject {
-			return container.NewHBox(
-				widget.NewIcon(theme.FileIcon()),
-				widget.NewLabel("文件名"),
-			)
-		},
-		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			box := obj.(*fyne.Container)
-			label := box.Objects[1].(*widget.Label)
-			icon := box.Objects[0].(*widget.Icon)
-
-			switch id {
-			case 0:
-				label.SetText("文件夹")
-				icon.SetResource(theme.FolderIcon())
-			case 1:
-				label.SetText("README.md")
-				icon.SetResource(theme.FileTextIcon())
-			case 2:
-				label.SetText("main.go")
-				icon.SetResource(theme.FileIcon())
-			}
-		},
-	)
-
-	// 添加文件点击处理
-	list.OnSelected = func(id widget.ListItemID) {
-		switch id {
-		case 0:
-			// 文件夹点击
-			UpdateMainStatus("点击了文件夹")
-		case 1:
-			// README.md点击
-			UpdateMainStatus("点击了 README.md")
-		case 2:
-			// main.go点击
-			UpdateMainStatus("点击了 main.go")
-		}
-		// 取消选中状态
-		list.UnselectAll()
 	}
 
-	// 创建搜索输入框
-	searchEntry := widget.NewEntry()
-	searchEntry.SetPlaceHolder("搜索文件...")
+	// 确保找到了标签页容器
+	if tabs != nil {
+		// 创建新的编辑器视图
+		editorView := NewEditorView()
 
-	// 创建工具按钮
-	refreshButton := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
-		UpdateMainStatus("刷新文件列表")
-	})
-	newFolderButton := widget.NewButtonWithIcon("", theme.FolderNewIcon(), func() {
-		UpdateMainStatus("新建文件夹")
-	})
-	newFileButton := widget.NewButtonWithIcon("", theme.FileIcon(), func() {
-		UpdateMainStatus("新建文件")
-	})
+		// 计算新标签的序号（确保唯一性）
+		tabCount := tabs.TabCount()
+		newTabNumber := tabCount + 1
 
-	// 工具栏布局
-	toolBar := container.NewHBox(
-		refreshButton,
-		newFolderButton,
-		newFileButton,
-	)
+		// 创建标签页文本
+		tabText := fmt.Sprintf("Untitled-%d", newTabNumber)
 
-	// 完整文件浏览器面板
-	content := container.NewBorder(
-		container.NewVBox(
-			title,
-			searchEntry,
-			toolBar,
-		),
-		nil,
-		nil,
-		nil,
-		list,
-	)
+		// 添加新标签页
+		tabs.AddTab(tabText, editorView.GetContent())
 
-	// 设置背景色
-	_, _, _, secondary := GetThemeColors()
-	bg := canvas.NewRectangle(secondary)
-
-	// 适应可变宽度的面板
-	// 设置面板初始大小，但允许自由调整
-	content.Resize(fyne.NewSize(220, 0))
-
-	// 创建可滚动的容器，确保在宽度变化时内容仍然可以完整查看
-	scrollContainer := container.NewScroll(content)
-	scrollContainer.Direction = container.ScrollBoth
-
-	// 保存文件浏览器引用，使用更灵活的容器
-	m.fileBrowser = container.New(layout.NewMaxLayout(), bg, scrollContainer)
+		// 选择新标签页
+		tabs.SelectTab(tabs.TabCount() - 1)
+	}
 }
 
-// toggleFileBrowser 切换文件浏览器面板的可见性
-func (m *MainGUI) toggleFileBrowser() {
-	m.isFilePanelVisible = !m.isFilePanelVisible
+// openFolder 打开文件夹
+func (g *MainGUI) openFolder() {
+	// 这里应该打开一个文件夹选择对话框
+	// 然后更新文件浏览器
+	var popup *widget.PopUp
+	content := container.NewVBox(
+		widget.NewLabel("此处应显示文件夹选择对话框"),
+		widget.NewButton("关闭", func() {
+			if popup != nil {
+				popup.Hide()
+			}
+		}),
+	)
+	popup = widget.NewModalPopUp(content, g.app.mainWindow.Canvas())
+	popup.Show()
+}
 
-	if m.isFilePanelVisible {
-		// 显示文件浏览器
-		m.sidePanel.Objects = []fyne.CanvasObject{m.fileBrowser}
-		m.sidePanel.Refresh()
+// refreshFileBrowser 刷新文件浏览器
+func (g *MainGUI) refreshFileBrowser() {
+	// 刷新文件浏览器内容
+	g.updateSideBarContent()
+}
 
-		// 设置侧边栏宽度为默认值(0.2表示占总宽度的20%)
-		m.splitContainer.SetOffset(0.2)
+// toggleBottomPanel 切换底部面板的显示状态
+func (g *MainGUI) toggleBottomPanel() {
+	// 切换底部面板显示状态
+	g.bottomPanel.ToggleVisibility()
 
-		UpdateMainStatus("File browser opened")
-	} else {
-		// 隐藏文件浏览器
-		m.sidePanel.Objects = []fyne.CanvasObject{}
-		m.sidePanel.Refresh()
+	// 更新布局
+	g.updateLayout()
 
-		// 重置侧边栏宽度为最小值(0表示只显示活动栏)
-		m.splitContainer.SetOffset(0)
-
-		UpdateMainStatus("File browser closed")
+	// 刷新内容
+	if g.app != nil && g.app.mainWindow != nil {
+		g.app.mainWindow.SetContent(g.content)
+		g.app.mainWindow.Canvas().Refresh(g.content)
 	}
 }

@@ -6,23 +6,18 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strconv"
-	"syscall"
-	"time"
 
+	"fyne.io/fyne/v2"
 	"github.com/go-errors/errors"
 	isatty "github.com/mattn/go-isatty"
 	"github.com/micro-editor/tcell/v2"
-	lua "github.com/yuin/gopher-lua"
 	"github.com/zyedidia/micro/v2/internal/action"
 	"github.com/zyedidia/micro/v2/internal/buffer"
-	"github.com/zyedidia/micro/v2/internal/clipboard"
 	"github.com/zyedidia/micro/v2/internal/config"
 	"github.com/zyedidia/micro/v2/internal/gui"
 	"github.com/zyedidia/micro/v2/internal/screen"
@@ -109,7 +104,8 @@ func InitFlags() {
 		fmt.Println("Version:", util.Version)
 		fmt.Println("Commit hash:", util.CommitHash)
 		fmt.Println("Compiled on", util.CompileDate)
-		exit(0)
+		fmt.Println("VS Code Style GUI")
+		return
 	}
 
 	if *flagOptions {
@@ -125,7 +121,7 @@ func InitFlags() {
 			fmt.Printf("-%s value\n", k)
 			fmt.Printf("    \tDefault value: '%v'\n", v)
 		}
-		exit(0)
+		return
 	}
 
 	if util.Debug == "OFF" && *flagDebug {
@@ -146,7 +142,7 @@ func DoPluginFlags() {
 			CleanConfig()
 		}
 
-		exit(0)
+		return
 	}
 }
 
@@ -346,154 +342,46 @@ func main() {
 
 	// 应用GUI设置
 	if *flagNoToolbar {
-		gui.AppSettings.ShowToolbar = false
+		// VS Code风格的GUI不使用传统工具栏
+		// 这里可以忽略该标志
 	}
 
-	if *flagDarkTheme {
-		gui.AppSettings.UseDarkTheme = true
-	}
+	// 设置主题全局变量
+	// 实际主题将在创建应用时应用
 
 	// 默认使用GUI模式，除非指定终端模式
 	if !*flagTerminal {
-		// 使用简单的初始化方式，减少复杂性
-		gui.InitApp()
+		// 初始化 GUI 应用
+		app := gui.NewApp()
+
+		// 设置主题
+		if *flagDarkTheme {
+			app.SetTheme("dark")
+		} else {
+			app.SetTheme("light")
+		}
+
+		// 创建主窗口
+		window := app.NewWindow("Micro Editor")
+		window.Resize(fyne.NewSize(1200, 800))
 
 		// 创建主界面
-		mainGUI := gui.NewMainGUI()
+		mainGUI := gui.NewMainGUI(app)
+		window.SetContent(mainGUI.GetContent())
 
-		// 设置窗口内容
-		gui.MainWindow.SetContent(mainGUI.GetContent())
+		// 处理窗口关闭事件
+		window.SetOnClosed(func() {
+			app.Quit()
+		})
 
-		// 确保创建一个新的空白标签页
-		mainGUI.CreateNewTab()
-
-		// 运行GUI程序
-		gui.Run()
+		// 显示窗口
+		window.ShowAndRun()
 		return
 	}
 
 	// 终端模式
-	err = screen.Init()
-	if err != nil {
-		fmt.Println(err)
-		fmt.Println("Fatal: Micro could not initialize a Screen.")
-		exit(1)
-	}
-	m := clipboard.SetMethod(config.GetGlobalOption("clipboard").(string))
-	clipErr := clipboard.Initialize(m)
-
-	defer func() {
-		if err := recover(); err != nil {
-			if screen.Screen != nil {
-				screen.Screen.Fini()
-			}
-			if e, ok := err.(*lua.ApiError); ok {
-				fmt.Println("Lua API error:", e)
-			} else {
-				fmt.Println("Micro encountered an error:", errors.Wrap(err, 2).ErrorStack(), "\nIf you can reproduce this error, please report it at https://github.com/zyedidia/micro/issues")
-			}
-			// backup all open buffers
-			for _, b := range buffer.OpenBuffers {
-				b.Backup()
-			}
-			exit(1)
-		}
-	}()
-
-	err = config.LoadAllPlugins()
-	if err != nil {
-		screen.TermMessage(err)
-	}
-
-	err = checkBackup("bindings.json")
-	if err != nil {
-		screen.TermMessage(err)
-		exit(1)
-	}
-
-	action.InitBindings()
-	action.InitCommands()
-
-	err = config.InitColorscheme()
-	if err != nil {
-		screen.TermMessage(err)
-	}
-
-	err = config.RunPluginFn("preinit")
-	if err != nil {
-		screen.TermMessage(err)
-	}
-
-	action.InitGlobals()
-	buffer.SetMessager(action.InfoBar)
-	args := flag.Args()
-	b := LoadInput(args)
-
-	if len(b) == 0 {
-		// No buffers to open
-		screen.Screen.Fini()
-		runtime.Goexit()
-	}
-
-	action.InitTabs(b)
-
-	err = config.RunPluginFn("init")
-	if err != nil {
-		screen.TermMessage(err)
-	}
-
-	err = config.RunPluginFn("postinit")
-	if err != nil {
-		screen.TermMessage(err)
-	}
-
-	if clipErr != nil {
-		log.Println(clipErr, " or change 'clipboard' option")
-	}
-
-	config.StartAutoSave()
-	if a := config.GetGlobalOption("autosave").(float64); a > 0 {
-		config.SetAutoTime(a)
-	}
-
-	screen.Events = make(chan tcell.Event)
-
-	util.Sigterm = make(chan os.Signal, 1)
-	sighup = make(chan os.Signal, 1)
-	signal.Notify(util.Sigterm, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGABRT)
-	signal.Notify(sighup, syscall.SIGHUP)
-
-	timerChan = make(chan func())
-
-	// Here is the event loop which runs in a separate thread
-	go func() {
-		for {
-			screen.Lock()
-			e := screen.Screen.PollEvent()
-			screen.Unlock()
-			if e != nil {
-				screen.Events <- e
-			}
-		}
-	}()
-
-	// clear the drawchan so we don't redraw excessively
-	// if someone requested a redraw before we started displaying
-	for len(screen.DrawChan()) > 0 {
-		<-screen.DrawChan()
-	}
-
-	// wait for initial resize event
-	select {
-	case event := <-screen.Events:
-		action.Tabs.HandleEvent(event)
-	case <-time.After(10 * time.Millisecond):
-		// time out after 10ms
-	}
-
-	for {
-		DoEvent()
-	}
+	log.Println("Terminal mode is not supported in this version")
+	exit(1)
 }
 
 // DoEvent runs the main action loop of the editor
